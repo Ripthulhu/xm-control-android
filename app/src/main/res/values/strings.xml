@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">XM Control</string>
+    <string name="app_source_label"></string>
+    <string name="tile_anc">XM Control</string>
+</resources>
