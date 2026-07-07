@@ -15,10 +15,21 @@ Android controller for Sony WH/WF-1000XM5 and XM6 headphones and earbuds.
 Open this folder in Android Studio, or build from a terminal with Android SDK 36 installed:
 
 ```sh
-gradle :app:assembleDebug
+./gradlew :app:assembleDebug
 ```
 
 The headset must already be paired in Android Bluetooth settings.
+
+## Releases
+
+GitHub Actions builds APK artifacts on every push.
+
+Signed releases are created from `v*` tags when these repository secrets are set:
+
+- `ANDROID_KEYSTORE_BASE64`
+- `ANDROID_KEYSTORE_PASSWORD`
+- `ANDROID_KEY_ALIAS`
+- `ANDROID_KEY_PASSWORD`
 
 ## Notes
 
