@@ -11,6 +11,7 @@ import android.os.Build;
 
 import com.ripthulhu.xmcontrol.tiles.store.TilePreferences;
 
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -62,14 +63,40 @@ public final class SonyDeviceRepository {
         Set<BluetoothDevice> bonded = adapter.getBondedDevices();
         if (bonded == null) return null;
 
+        BluetoothDevice selected = null;
+        BluetoothDevice connected = null;
         BluetoothDevice fallback = null;
         for (BluetoothDevice device : bonded) {
             if (isSelectedClassicDevice(device, selectedAddress)) {
-                return device;
+                selected = device;
             }
-            if (isSupportedDevice(device) && fallback == null) fallback = device;
+            if (isSupportedDevice(device) && isConnectedDevice(device) && connected == null) {
+                connected = device;
+            }
+            if (isSupportedDevice(device) && fallback == null) {
+                fallback = device;
+            }
         }
-        return fallback;
+
+        if (selected != null && (connected == null || selected.getAddress().equals(connected.getAddress()))) {
+            return selected;
+        }
+        if (connected != null) {
+            return connected;
+        }
+        return selected != null ? selected : fallback;
+    }
+
+    @SuppressLint("MissingPermission")
+    public static String connectedSupportedAddress(Context context, List<BluetoothDevice> devices) {
+        if (!hasConnectPermission(context) || devices == null) return null;
+        for (BluetoothDevice device : devices) {
+            if ((isSupportedDevice(device) || isSelectedClassicDevice(device, TilePreferences.selectedDeviceAddress(context)))
+                    && isConnectedDevice(device)) {
+                return device.getAddress();
+            }
+        }
+        return null;
     }
 
     public static boolean hasSupportedDevice(Context context) {
@@ -113,6 +140,17 @@ public final class SonyDeviceRepository {
         return isSupportedName(name)
                 && !isLeAlias(name)
                 && device.getType() != BluetoothDevice.DEVICE_TYPE_LE;
+    }
+
+    private static boolean isConnectedDevice(BluetoothDevice device) {
+        if (device == null) return false;
+        try {
+            Method method = BluetoothDevice.class.getMethod("isConnected");
+            Object value = method.invoke(device);
+            return value instanceof Boolean && (Boolean) value;
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            return false;
+        }
     }
 
     @SuppressLint("MissingPermission")

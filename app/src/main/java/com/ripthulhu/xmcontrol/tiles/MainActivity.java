@@ -695,6 +695,10 @@ public final class MainActivity extends Activity {
         row.setPadding(0, dp(10), 0, dp(10));
         row.setChecked(device.getAddress().equals(selected));
         row.setOnClickListener(v -> {
+            if (device.getAddress().equals(TilePreferences.selectedDeviceAddress(this))) {
+                requestStatusRefresh(true);
+                return;
+            }
             TilePreferences.setSelectedDeviceAddress(this, device.getAddress());
             localChangeVersion++;
             refreshDevices();
@@ -1382,18 +1386,38 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                 && !SonyDeviceRepository.hasConnectPermission(this)) {
             requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, REQUEST_BLUETOOTH);
+            return;
         }
+        onBluetoothPermissionAvailable();
     }
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_BLUETOOTH) {
-            refreshDevices();
+            if (SonyDeviceRepository.hasConnectPermission(this)) {
+                onBluetoothPermissionAvailable();
+            } else {
+                TilePreferences.markHeadsetDisconnected(this);
+                renderState("Bluetooth access required");
+            }
         }
     }
 
+    private void onBluetoothPermissionAvailable() {
+        buildUi();
+        refreshDevices();
+        main.postDelayed(this::refreshDevices, 450L);
+        main.postDelayed(this::refreshDevices, 1_500L);
+        scheduleConnectionRetry();
+    }
+
     private String selectedOrFallback(List<BluetoothDevice> devices) {
+        String connected = SonyDeviceRepository.connectedSupportedAddress(this, devices);
+        if (connected != null) {
+            return connected;
+        }
+
         String selected = TilePreferences.selectedDeviceAddress(this);
         for (BluetoothDevice device : devices) {
             if (device.getAddress().equals(selected)) {
