@@ -93,6 +93,10 @@ public final class TilePreferences {
         prefs(context).edit().putLong(KEY_NOISE_LAST_REFRESH, System.currentTimeMillis()).apply();
     }
 
+    public static void invalidateNoiseState(Context context) {
+        prefs(context).edit().putLong(KEY_NOISE_LAST_REFRESH, 0L).apply();
+    }
+
     public static boolean shouldRefreshStatus(Context context) {
         long last = prefs(context).getLong(KEY_STATUS_LAST_REFRESH, 0L);
         return System.currentTimeMillis() - last >= STATUS_REFRESH_THROTTLE_MS;
@@ -103,6 +107,13 @@ public final class TilePreferences {
         prefs(context).edit()
                 .putLong(KEY_STATUS_LAST_REFRESH, now)
                 .putLong(KEY_NOISE_LAST_REFRESH, now)
+                .apply();
+    }
+
+    public static void invalidateStatus(Context context) {
+        prefs(context).edit()
+                .putLong(KEY_STATUS_LAST_REFRESH, 0L)
+                .putLong(KEY_NOISE_LAST_REFRESH, 0L)
                 .apply();
     }
 
@@ -275,15 +286,21 @@ public final class TilePreferences {
     }
 
     public static void applyStatus(Context context, HeadsetStatus status) {
+        applyStatus(context, status, false);
+    }
+
+    public static void applyStatus(Context context, HeadsetStatus status, boolean markRefreshed) {
         if (status == null) {
             return;
         }
 
-        long now = System.currentTimeMillis();
         SharedPreferences.Editor editor = prefs(context).edit();
         editor.putBoolean(KEY_HEADSET_CONNECTED, true);
-        editor.putLong(KEY_STATUS_LAST_REFRESH, now);
-        editor.putLong(KEY_NOISE_LAST_REFRESH, now);
+        if (markRefreshed) {
+            long now = System.currentTimeMillis();
+            editor.putLong(KEY_STATUS_LAST_REFRESH, now);
+            editor.putLong(KEY_NOISE_LAST_REFRESH, now);
+        }
         if (status.batteryText != null) {
             String battery = status.batteryText;
             if (status.caseBatteryText != null) {

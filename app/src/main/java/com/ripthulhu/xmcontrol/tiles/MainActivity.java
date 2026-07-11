@@ -61,6 +61,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public final class MainActivity extends Activity {
     private static final int REQUEST_BLUETOOTH = 7001;
@@ -106,12 +107,14 @@ public final class MainActivity extends Activity {
             }
             if (!statusReadRunning && SonyDeviceRepository.hasConfiguredDevice(MainActivity.this)) {
                 boolean cachedConnected = TilePreferences.headsetConnected(MainActivity.this);
-                boolean audioConnected = SonyDeviceRepository.hasConnectedAudioProfile(MainActivity.this);
+                boolean audioConnected = SonyDeviceRepository.isSelectedDeviceConnected(MainActivity.this);
                 if (!audioConnected) {
                     if (cachedConnected) {
                         statusFailureCount = 2;
                         TilePreferences.markHeadsetDisconnected(MainActivity.this);
                         renderState("Not connected");
+                    } else if (statusFailureCount < 2) {
+                        requestStatusRefresh(true);
                     }
                 } else {
                     requestStatusRefresh(!cachedConnected);
@@ -169,8 +172,10 @@ public final class MainActivity extends Activity {
     private SeekBar ambientSeekBar;
     private final SeekBar[] eqSeekBars = new SeekBar[6];
     private final TextView[] eqValueTexts = new TextView[6];
+    private final boolean[] eqSliderDragging = new boolean[6];
 
     private boolean updatingUi;
+    private boolean ambientSliderDragging;
     private boolean destroyed;
     private boolean statusReadRunning;
     private boolean statusRefreshQueued;
@@ -180,6 +185,8 @@ public final class MainActivity extends Activity {
     private int localChangeVersion;
     private int restoredScrollY;
     private int statusFailureCount;
+    private int statusReadGeneration;
+    private Future<?> statusReadFuture;
     private final Runnable delayedConnectionCheck = () -> {
         if (destroyed || !bluetoothReceiverRegistered || statusReadRunning) {
             return;
@@ -244,6 +251,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         destroyed = true;
+        cancelStatusRefreshForCommand();
         main.removeCallbacksAndMessages(null);
         commands.shutdownNow();
         super.onDestroy();
@@ -405,20 +413,24 @@ public final class MainActivity extends Activity {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 if (!fromUser) return;
-                NoiseControlState current = TilePreferences.noiseControlState(MainActivity.this);
-                TilePreferences.setNoiseControlState(MainActivity.this,
-                        new NoiseControlState(current.mode, progress, current.voiceAmbient));
-                renderState(null);
+                int level = SmoothSlider.value(seekBar);
+                setTextIfChanged(ambientLevelText, String.valueOf(level));
+                if (!ambientSliderDragging) {
+                    NoiseControlState current = TilePreferences.noiseControlState(MainActivity.this);
+                    sendNoiseState(NoiseControlState.ambient(level, current.voiceAmbient));
+                }
             }
 
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {
+                ambientSliderDragging = true;
             }
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
+                ambientSliderDragging = false;
                 NoiseControlState current = TilePreferences.noiseControlState(MainActivity.this);
-                sendNoiseState(NoiseControlState.ambient(seekBar.getProgress(), current.voiceAmbient));
+                sendNoiseState(NoiseControlState.ambient(SmoothSlider.value(seekBar), current.voiceAmbient));
             }
         });
 
@@ -629,19 +641,28 @@ public final class MainActivity extends Activity {
         slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                updateEqValueLabel(band, progress);
+                int value = SmoothSlider.value(seekBar);
+                updateEqValueLabel(band, value);
                 if (!fromUser || updatingUi) return;
-                TilePreferences.editEqValueAsManual(MainActivity.this, band, progress);
-                renderState(null);
-                scheduleEqSend(420L);
+                if (!eqSliderDragging[band]) {
+                    TilePreferences.editEqValueAsManual(MainActivity.this, band, value);
+                    renderEqualizer();
+                    scheduleEqSend(90L);
+                }
             }
 
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {
+                eqSliderDragging[band] = true;
+                cancelPendingEqSend();
             }
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
+                eqSliderDragging[band] = false;
+                TilePreferences.editEqValueAsManual(
+                        MainActivity.this, band, SmoothSlider.value(seekBar));
+                renderEqualizer();
                 scheduleEqSend(90L);
             }
         });
@@ -649,6 +670,10 @@ public final class MainActivity extends Activity {
     }
 
     private void refreshDevices() {
+        refreshDevices(false);
+    }
+
+    private void refreshDevices(boolean forceStatus) {
         if (deviceList == null) return;
         deviceList.removeAllViews();
         if (!SonyDeviceRepository.hasConnectPermission(this)) {
@@ -668,7 +693,8 @@ public final class MainActivity extends Activity {
 
         String previous = TilePreferences.selectedDeviceAddress(this);
         String selected = selectedOrFallback(devices);
-        if (!selected.equals(previous)) {
+        boolean selectionChanged = !selected.equals(previous);
+        if (selectionChanged) {
             TilePreferences.setSelectedDeviceAddress(this, selected);
         }
 
@@ -676,7 +702,7 @@ public final class MainActivity extends Activity {
             deviceList.addView(deviceRow(device, selected));
         }
         renderState(null);
-        requestStatusRefresh(true);
+        requestStatusRefresh(forceStatus || selectionChanged);
     }
 
     @SuppressLint("MissingPermission")
@@ -701,7 +727,7 @@ public final class MainActivity extends Activity {
             }
             TilePreferences.setSelectedDeviceAddress(this, device.getAddress());
             localChangeVersion++;
-            refreshDevices();
+            refreshDevices(true);
         });
         return row;
     }
@@ -746,8 +772,7 @@ public final class MainActivity extends Activity {
             }
             statusFailureCount = 0;
             localChangeVersion++;
-            refreshDevices();
-            requestStatusRefresh(true);
+            refreshDevices(true);
             return;
         }
 
@@ -788,20 +813,23 @@ public final class MainActivity extends Activity {
         }
 
         int requestVersion = localChangeVersion;
+        int requestGeneration = ++statusReadGeneration;
         statusReadRunning = true;
         renderState("Updating...");
         NoiseControlState fallback = TilePreferences.noiseControlState(this);
-        commands.execute(() -> {
+        statusReadFuture = commands.submit(() -> {
             SonyMdrClient.StatusResult result = SonyMdrClient.readStatus(this, fallback);
             main.post(() -> {
                 if (destroyed) return;
+                if (requestGeneration != statusReadGeneration) return;
+                statusReadFuture = null;
                 statusReadRunning = false;
                 if (result.success && requestVersion == localChangeVersion) {
                     statusFailureCount = 0;
-                    TilePreferences.applyStatus(this, result.status);
+                    TilePreferences.applyStatus(this, result.status, result.complete);
                     renderState(null);
                 } else {
-                    boolean audioConnected = SonyDeviceRepository.hasConnectedAudioProfile(this);
+                    boolean audioConnected = SonyDeviceRepository.isSelectedDeviceConnected(this);
                     if (!result.success) {
                         statusFailureCount++;
                         if (!audioConnected || statusFailureCount >= 2) {
@@ -820,6 +848,17 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void cancelStatusRefreshForCommand() {
+        statusReadGeneration++;
+        statusReadRunning = false;
+        statusRefreshQueued = false;
+        Future<?> future = statusReadFuture;
+        statusReadFuture = null;
+        if (future != null) {
+            future.cancel(true);
+        }
+    }
+
     private void renderState(String statusOverride) {
         updatingUi = true;
         try {
@@ -833,11 +872,13 @@ public final class MainActivity extends Activity {
             if (noiseStatusText != null) {
                 noiseStatusText.setText(noise.summary());
             }
-            if (ambientLevelText != null) {
-                ambientLevelText.setText(String.valueOf(noise.ambientLevel));
+            if (!ambientSliderDragging) {
+                setTextIfChanged(ambientLevelText, String.valueOf(noise.ambientLevel));
             }
-            if (ambientSeekBar != null && ambientSeekBar.getProgress() != noise.ambientLevel) {
-                ambientSeekBar.setProgress(noise.ambientLevel);
+            if (ambientSeekBar != null
+                    && !ambientSliderDragging
+                    && !SmoothSlider.isAtValue(ambientSeekBar, noise.ambientLevel)) {
+                SmoothSlider.setValue(ambientSeekBar, noise.ambientLevel);
             }
 
             setSelected(noiseAncButton, noise.mode == NoiseControlState.Mode.ANC);
@@ -881,7 +922,7 @@ public final class MainActivity extends Activity {
             renderEqualizer();
             renderQuickAccess();
             setControlsEnabled(TilePreferences.headsetConnected(this)
-                    && SonyDeviceRepository.hasConnectedAudioProfile(this));
+                    && SonyDeviceRepository.isSelectedDeviceConnected(this));
 
         } finally {
             updatingUi = false;
@@ -946,8 +987,11 @@ public final class MainActivity extends Activity {
             setSettingText(eqSummaryText, "Equalizer", eqSummary(preset, values));
         }
         for (int i = 0; i < eqSeekBars.length; i++) {
-            if (eqSeekBars[i] != null && eqSeekBars[i].getProgress() != values[i]) {
-                eqSeekBars[i].setProgress(values[i]);
+            if (eqSliderDragging[i]) {
+                continue;
+            }
+            if (eqSeekBars[i] != null && !SmoothSlider.isAtValue(eqSeekBars[i], values[i])) {
+                SmoothSlider.setValue(eqSeekBars[i], values[i]);
             }
             updateEqValueLabel(i, values[i]);
         }
@@ -955,7 +999,7 @@ public final class MainActivity extends Activity {
 
     private void updateEqValueLabel(int index, int value) {
         if (index < 0 || index >= eqValueTexts.length || eqValueTexts[index] == null) return;
-        eqValueTexts[index].setText(eqValue(value));
+        setTextIfChanged(eqValueTexts[index], eqValue(value));
     }
 
     private void sendNoiseControl(NoiseControlState.Mode mode) {
@@ -1041,11 +1085,14 @@ public final class MainActivity extends Activity {
             renderState("Connect your headset to make changes");
             return;
         }
+        boolean previousEnabled = TilePreferences.voiceGuidanceEnabled(this);
+        int previousLanguage = TilePreferences.voiceGuidanceLanguage(this);
         localChangeVersion++;
         TilePreferences.setVoiceGuidance(this, enabled, language);
         renderState("Applying...");
         SonyCommand command = SonyCommand.voiceGuidance(enabled, language, type);
         NoiseControlState fallback = TilePreferences.noiseControlState(this);
+        cancelStatusRefreshForCommand();
         commands.execute(() -> {
             SonyMdrClient.StatusResult result = SonyMdrClient.sendVoiceGuidance(this, command, fallback);
             main.post(() -> {
@@ -1058,6 +1105,8 @@ public final class MainActivity extends Activity {
                 }
 
                 statusFailureCount = Math.max(statusFailureCount, 1);
+                TilePreferences.setVoiceGuidance(this, previousEnabled, previousLanguage);
+                TilePreferences.invalidateStatus(this);
                 main.removeCallbacks(delayedConnectionCheck);
                 main.postDelayed(delayedConnectionCheck, 1_500L);
                 showFailureToast(result.message);
@@ -1093,9 +1142,13 @@ public final class MainActivity extends Activity {
             return;
         }
 
+        cancelPendingEqSend();
+        int previousPreset = TilePreferences.eqPreset(this);
+        int[] previousValues = TilePreferences.eqValues(this);
         localChangeVersion++;
         TilePreferences.setEqPreset(this, preset);
         renderState("Applying equalizer...");
+        cancelStatusRefreshForCommand();
         commands.execute(() -> {
             SonyMdrClient.Result result = SonyMdrClient.send(this, SonyCommand.equalizerPreset(preset));
             SonyMdrClient.StatusResult eqResult = result.success ? SonyMdrClient.readEqualizerState(this) : null;
@@ -1103,6 +1156,8 @@ public final class MainActivity extends Activity {
                 if (destroyed) return;
                 if (!result.success) {
                     statusFailureCount = Math.max(statusFailureCount, 1);
+                    TilePreferences.setEqState(this, previousPreset, previousValues);
+                    TilePreferences.invalidateStatus(this);
                     main.removeCallbacks(delayedConnectionCheck);
                     main.postDelayed(delayedConnectionCheck, 1_500L);
                     showFailureToast(result.message);
@@ -1130,12 +1185,14 @@ public final class MainActivity extends Activity {
     }
 
     private void setEqualizerFlat() {
+        cancelPendingEqSend();
         int[] flat = SonyCommand.flatEqualizerValues();
         sendCommand("Equalizer flat", SonyCommand.equalizer(EQ_MANUAL, flat),
                 () -> TilePreferences.setEqState(this, EQ_MANUAL, flat));
     }
 
     private void saveEqualizerPreset(int preset) {
+        cancelPendingEqSend();
         int[] values = TilePreferences.eqValues(this);
         sendCommand("Save " + eqPresetName(preset), SonyCommand.equalizer(preset, values),
                 () -> TilePreferences.setEqState(this, preset, values));
@@ -1147,6 +1204,10 @@ public final class MainActivity extends Activity {
         }
         main.removeCallbacks(pendingEqSend);
         main.postDelayed(pendingEqSend, delayMs);
+    }
+
+    private void cancelPendingEqSend() {
+        main.removeCallbacks(pendingEqSend);
     }
 
     private void sendCurrentEqualizer() {
@@ -1171,12 +1232,14 @@ public final class MainActivity extends Activity {
             optimisticUpdate.run();
         }
         renderState("Applying...");
+        cancelStatusRefreshForCommand();
         commands.execute(() -> {
             SonyMdrClient.Result result = SonyMdrClient.send(this, command);
             main.post(() -> {
                 if (destroyed) return;
                 if (!result.success) {
                     statusFailureCount = Math.max(statusFailureCount, 1);
+                    TilePreferences.invalidateStatus(this);
                     main.removeCallbacks(delayedConnectionCheck);
                     main.postDelayed(delayedConnectionCheck, 1_500L);
                     showFailureToast(result.message);
@@ -1406,9 +1469,9 @@ public final class MainActivity extends Activity {
 
     private void onBluetoothPermissionAvailable() {
         buildUi();
-        refreshDevices();
-        main.postDelayed(this::refreshDevices, 450L);
-        main.postDelayed(this::refreshDevices, 1_500L);
+        refreshDevices(true);
+        main.postDelayed(() -> refreshDevices(false), 450L);
+        main.postDelayed(() -> refreshDevices(false), 1_500L);
         scheduleConnectionRetry();
     }
 
@@ -1461,12 +1524,17 @@ public final class MainActivity extends Activity {
         setEnabled(eqSaveButton, enabled);
         setEnabled(eqFlatButton, enabled);
         if (ambientSeekBar != null) {
-            ambientSeekBar.setEnabled(enabled);
+            if (!ambientSliderDragging && ambientSeekBar.isEnabled() != enabled) {
+                ambientSeekBar.setEnabled(enabled);
+            }
             ambientSeekBar.setAlpha(1f);
         }
-        for (SeekBar seekBar : eqSeekBars) {
+        for (int i = 0; i < eqSeekBars.length; i++) {
+            SeekBar seekBar = eqSeekBars[i];
             if (seekBar != null) {
-                seekBar.setEnabled(enabled);
+                if (!eqSliderDragging[i] && seekBar.isEnabled() != enabled) {
+                    seekBar.setEnabled(enabled);
+                }
                 seekBar.setAlpha(1f);
             }
         }
@@ -1487,6 +1555,12 @@ public final class MainActivity extends Activity {
         if (button == null) return;
         button.setTextColor(selected ? onPrimary : text);
         button.setBackground(buttonBackground(selected ? primary : surfaceVariant, dp(CONTROL_RADIUS_DP)));
+    }
+
+    private void setTextIfChanged(TextView view, String value) {
+        if (view != null && !TextUtils.equals(view.getText(), value)) {
+            view.setText(value);
+        }
     }
 
     private TextView settingTitle(String title, String value) {
@@ -1639,7 +1713,7 @@ public final class MainActivity extends Activity {
 
     private SeekBar seekBar(int max) {
         SeekBar seekBar = new SeekBar(this);
-        seekBar.setMax(max);
+        SmoothSlider.configure(seekBar, max);
         seekBar.setSplitTrack(false);
         seekBar.setMinimumHeight(dp(40));
         seekBar.setThumb(sliderThumb());

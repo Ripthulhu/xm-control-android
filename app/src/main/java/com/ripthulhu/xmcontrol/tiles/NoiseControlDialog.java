@@ -37,12 +37,14 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Future;
 
 public final class NoiseControlDialog extends Dialog {
     private static final int CONTROL_HEIGHT_DP = 50;
     private static final int CONTROL_RADIUS_DP = 20;
     private static final int CONTROL_HORIZONTAL_GAP_DP = 5;
     private static final int CONTROL_VERTICAL_GAP_DP = 6;
+    private static final long OPERATION_TIMEOUT_MS = 30_000L;
 
     private final int surface;
     private final int surfaceVariant;
@@ -75,9 +77,18 @@ public final class NoiseControlDialog extends Dialog {
             if (closed || !operationRunning) {
                 return;
             }
+            operationGeneration++;
             operationRunning = false;
+            Future<?> future = activeOperationFuture;
+            activeOperationFuture = null;
+            if (future != null) {
+                future.cancel(true);
+            }
             clearPendingWork();
+            restoreConfirmedState();
+            TilePreferences.invalidateStatus(getContext());
             TilePreferences.markHeadsetDisconnected(getContext());
+            notifyStateChanged();
             updateUi("Not connected");
         }
     };
@@ -103,6 +114,8 @@ public final class NoiseControlDialog extends Dialog {
     private SeekBar clearBassSlider;
 
     private boolean closed;
+    private boolean transparencySliderDragging;
+    private boolean clearBassSliderDragging;
     private boolean windowHasFocus = true;
     private boolean operationRunning;
     private boolean refreshQueued;
@@ -113,6 +126,13 @@ public final class NoiseControlDialog extends Dialog {
     private Boolean queuedWearPause;
     private Integer queuedEqPreset;
     private int[] queuedEqValues;
+    private int operationGeneration;
+    private Future<?> activeOperationFuture;
+    private NoiseControlState confirmedNoiseState;
+    private boolean confirmedSpeakToChat;
+    private boolean confirmedWearPause;
+    private int confirmedEqPreset;
+    private int[] confirmedEqValues;
 
     public NoiseControlDialog(Context context, Runnable onStateChanged) {
         super(context, R.style.NoiseControlTileDialogTheme);
@@ -125,6 +145,11 @@ public final class NoiseControlDialog extends Dialog {
         muted = palette.muted;
         sliderTrack = palette.sliderTrack;
         this.onStateChanged = onStateChanged;
+        confirmedNoiseState = TilePreferences.noiseControlState(context);
+        confirmedSpeakToChat = TilePreferences.speakToChatEnabled(context);
+        confirmedWearPause = TilePreferences.wearPauseEnabled(context);
+        confirmedEqPreset = TilePreferences.eqPreset(context);
+        confirmedEqValues = TilePreferences.eqValues(context);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setCanceledOnTouchOutside(true);
     }
@@ -171,6 +196,12 @@ public final class NoiseControlDialog extends Dialog {
         main.removeCallbacks(dismissWhenUnfocused);
         main.removeCallbacks(pendingEqSend);
         main.removeCallbacks(operationWatchdog);
+        operationGeneration++;
+        Future<?> future = activeOperationFuture;
+        activeOperationFuture = null;
+        if (future != null) {
+            future.cancel(true);
+        }
         commands.shutdownNow();
         stopKeepAlive();
         super.dismiss();
@@ -237,20 +268,24 @@ public final class NoiseControlDialog extends Dialog {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 if (!fromUser) return;
-                NoiseControlState current = TilePreferences.noiseControlState(getContext());
-                TilePreferences.setNoiseControlState(getContext(),
-                        new NoiseControlState(current.mode, progress, current.voiceAmbient));
-                updateUi(null);
+                int level = SmoothSlider.value(seekBar);
+                setTextIfChanged(levelValueText, String.valueOf(level));
+                if (!transparencySliderDragging) {
+                    NoiseControlState current = TilePreferences.noiseControlState(getContext());
+                    sendState(NoiseControlState.ambient(level, current.voiceAmbient));
+                }
             }
 
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {
+                transparencySliderDragging = true;
             }
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
+                transparencySliderDragging = false;
                 NoiseControlState current = TilePreferences.noiseControlState(getContext());
-                sendState(NoiseControlState.ambient(seekBar.getProgress(), current.voiceAmbient));
+                sendState(NoiseControlState.ambient(SmoothSlider.value(seekBar), current.voiceAmbient));
             }
         });
 
@@ -291,18 +326,30 @@ public final class NoiseControlDialog extends Dialog {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 if (!fromUser) return;
-                queuedEqPreset = null;
-                TilePreferences.editEqValueAsManual(getContext(), TilePreferences.EQ_CLEAR_BASS_INDEX, progress);
-                updateUi(null);
-                scheduleEqualizerSend(420L);
+                int value = SmoothSlider.value(seekBar);
+                setTextIfChanged(clearBassValueText, eqValue(value));
+                if (!clearBassSliderDragging) {
+                    queuedEqPreset = null;
+                    TilePreferences.editEqValueAsManual(
+                            getContext(), TilePreferences.EQ_CLEAR_BASS_INDEX, value);
+                    updateUi(null);
+                    scheduleEqualizerSend(90L);
+                }
             }
 
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {
+                clearBassSliderDragging = true;
+                main.removeCallbacks(pendingEqSend);
             }
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
+                clearBassSliderDragging = false;
+                queuedEqPreset = null;
+                TilePreferences.editEqValueAsManual(
+                        getContext(), TilePreferences.EQ_CLEAR_BASS_INDEX, SmoothSlider.value(seekBar));
+                updateUi(null);
                 scheduleEqualizerSend(90L);
             }
         });
@@ -372,6 +419,7 @@ public final class NoiseControlDialog extends Dialog {
     private void selectEqPreset(int preset) {
         if (closed) return;
         if (!canSendCommand()) return;
+        main.removeCallbacks(pendingEqSend);
         if (preset == TilePreferences.EQ_MANUAL) {
             int[] values = TilePreferences.manualEqValues(getContext());
             queuedEqPreset = null;
@@ -449,15 +497,13 @@ public final class NoiseControlDialog extends Dialog {
         if (queuedSpeakToChat != null) {
             boolean enabled = queuedSpeakToChat;
             queuedSpeakToChat = null;
-            runToggle("Speak-to-Chat", enabled, enabled ? SonyCommand.SPEAK_TO_CHAT_ON : SonyCommand.SPEAK_TO_CHAT_OFF,
-                    () -> TilePreferences.setSpeakToChatEnabled(getContext(), enabled));
+            runToggle(true, enabled, enabled ? SonyCommand.SPEAK_TO_CHAT_ON : SonyCommand.SPEAK_TO_CHAT_OFF);
             return;
         }
         if (queuedWearPause != null) {
             boolean enabled = queuedWearPause;
             queuedWearPause = null;
-            runToggle("Pause on Remove", enabled, enabled ? SonyCommand.WEAR_PAUSE_ON : SonyCommand.WEAR_PAUSE_OFF,
-                    () -> TilePreferences.setWearPauseEnabled(getContext(), enabled));
+            runToggle(false, enabled, enabled ? SonyCommand.WEAR_PAUSE_ON : SonyCommand.WEAR_PAUSE_OFF);
             return;
         }
         if (queuedEqPreset != null) {
@@ -476,25 +522,26 @@ public final class NoiseControlDialog extends Dialog {
     }
 
     private void runSend(NoiseControlState state) {
-        beginOperation();
+        int operation = beginOperation();
         TilePreferences.setNoiseControlState(getContext(), state);
         updateUi("Applying...");
-        executeCommand(() -> {
+        executeCommand(operation, () -> {
             SonyMdrClient.Result result = SonyMdrClient.send(getContext(), SonyCommand.noiseControl(state));
-            postUi(() -> {
+            postUi(operation, () -> {
                 boolean newerStateQueued = queuedState != null;
-                if (result.success && !newerStateQueued) {
+                if (result.success) {
                     TilePreferences.markHeadsetConnected(getContext());
-                    TilePreferences.setNoiseControlState(getContext(), state);
-                    TilePreferences.markNoiseStateRefreshed(getContext());
+                    confirmedNoiseState = state;
+                    if (!newerStateQueued) {
+                        TilePreferences.setNoiseControlState(getContext(), state);
+                        TilePreferences.markNoiseStateRefreshed(getContext());
+                    }
                     notifyStateChanged();
                 } else if (!result.success) {
-                    TilePreferences.markNoiseStateRefreshed(getContext());
-                    clearPendingWork();
-                    showFailureToast(result.message);
+                    handleOperationFailure(result.message);
                 }
 
-                endOperation();
+                endOperation(operation);
                 if (result.success && hasPendingWork()) {
                     drainQueue();
                     return;
@@ -505,23 +552,25 @@ public final class NoiseControlDialog extends Dialog {
     }
 
     private void runEqualizer(int[] values) {
-        beginOperation();
+        int operation = beginOperation();
         TilePreferences.setEqState(getContext(), TilePreferences.EQ_MANUAL, values);
         updateUi("Applying...");
-        executeCommand(() -> {
+        executeCommand(operation, () -> {
             SonyMdrClient.Result result = SonyMdrClient.send(getContext(), SonyCommand.equalizer(TilePreferences.EQ_MANUAL, values));
-            postUi(() -> {
+            postUi(operation, () -> {
                 if (result.success) {
                     TilePreferences.markHeadsetConnected(getContext());
-                    TilePreferences.setEqState(getContext(), TilePreferences.EQ_MANUAL, values);
+                    confirmedEqPreset = TilePreferences.EQ_MANUAL;
+                    confirmedEqValues = values.clone();
+                    if (queuedEqValues == null && queuedEqPreset == null) {
+                        TilePreferences.setEqState(getContext(), TilePreferences.EQ_MANUAL, values);
+                    }
                     notifyStateChanged();
                 } else {
-                    TilePreferences.markNoiseStateRefreshed(getContext());
-                    clearPendingWork();
-                    showFailureToast(result.message);
+                    handleOperationFailure(result.message);
                 }
 
-                endOperation();
+                endOperation(operation);
                 if (result.success && hasPendingWork()) {
                     drainQueue();
                     return;
@@ -532,15 +581,15 @@ public final class NoiseControlDialog extends Dialog {
     }
 
     private void runEqualizerPreset(int preset) {
-        beginOperation();
+        int operation = beginOperation();
         TilePreferences.setEqPreset(getContext(), preset);
         updateUi("Applying...");
-        executeCommand(() -> {
+        executeCommand(operation, () -> {
             SonyMdrClient.Result result = SonyMdrClient.send(getContext(), SonyCommand.equalizerPreset(preset));
             SonyMdrClient.StatusResult eqResult = result.success
                     ? SonyMdrClient.readEqualizerState(getContext())
                     : null;
-            postUi(() -> {
+            postUi(operation, () -> {
                 String nextStatus = null;
                 if (result.success) {
                     TilePreferences.markHeadsetConnected(getContext());
@@ -550,19 +599,24 @@ public final class NoiseControlDialog extends Dialog {
                             && eqResult.status.eqValues != null
                             && eqResult.status.eqValues.length >= TilePreferences.EQ_VALUE_COUNT) {
                         int returnedPreset = eqResult.status.eqPreset >= 0 ? eqResult.status.eqPreset : preset;
-                        TilePreferences.setEqState(getContext(), returnedPreset, eqResult.status.eqValues);
+                        confirmedEqPreset = returnedPreset;
+                        confirmedEqValues = eqResult.status.eqValues.clone();
+                        if (queuedEqValues == null && queuedEqPreset == null) {
+                            TilePreferences.setEqState(getContext(), returnedPreset, eqResult.status.eqValues);
+                        }
                     } else {
-                        TilePreferences.setEqPreset(getContext(), preset);
+                        confirmedEqPreset = preset;
+                        if (queuedEqValues == null && queuedEqPreset == null) {
+                            TilePreferences.setEqPreset(getContext(), preset);
+                        }
                         nextStatus = "Preset selected";
                     }
                     notifyStateChanged();
                 } else {
-                    TilePreferences.markNoiseStateRefreshed(getContext());
-                    clearPendingWork();
-                    showFailureToast(result.message);
+                    handleOperationFailure(result.message);
                 }
 
-                endOperation();
+                endOperation(operation);
                 if (result.success && hasPendingWork()) {
                     drainQueue();
                     return;
@@ -572,23 +626,31 @@ public final class NoiseControlDialog extends Dialog {
         });
     }
 
-    private void runToggle(String label, boolean enabled, SonyCommand command, Runnable onSuccess) {
-        beginOperation();
+    private void runToggle(boolean speakToChat, boolean enabled, SonyCommand command) {
+        int operation = beginOperation();
         updateUi("Applying...");
-        executeCommand(() -> {
+        executeCommand(operation, () -> {
             SonyMdrClient.Result result = SonyMdrClient.send(getContext(), command);
-            postUi(() -> {
+            postUi(operation, () -> {
                 if (result.success) {
                     TilePreferences.markHeadsetConnected(getContext());
-                    onSuccess.run();
+                    if (speakToChat) {
+                        confirmedSpeakToChat = enabled;
+                        if (queuedSpeakToChat == null) {
+                            TilePreferences.setSpeakToChatEnabled(getContext(), enabled);
+                        }
+                    } else {
+                        confirmedWearPause = enabled;
+                        if (queuedWearPause == null) {
+                            TilePreferences.setWearPauseEnabled(getContext(), enabled);
+                        }
+                    }
                     notifyStateChanged();
                 } else {
-                    TilePreferences.markNoiseStateRefreshed(getContext());
-                    clearPendingWork();
-                    showFailureToast(result.message);
+                    handleOperationFailure(result.message);
                 }
 
-                endOperation();
+                endOperation(operation);
                 if (result.success && hasPendingWork()) {
                     drainQueue();
                     return;
@@ -599,23 +661,24 @@ public final class NoiseControlDialog extends Dialog {
     }
 
     private void runSync(int requestedAtVersion) {
-        beginOperation();
+        int operation = beginOperation();
         updateUi("Updating...");
         NoiseControlState fallback = TilePreferences.noiseControlState(getContext());
-        executeCommand(() -> {
+        executeCommand(operation, () -> {
             SonyMdrClient.NoiseControlResult result = SonyMdrClient.readNoiseControlState(getContext(), fallback);
-            postUi(() -> {
+            postUi(operation, () -> {
                 if (result.success && requestedAtVersion == localChangeVersion && queuedState == null) {
                     TilePreferences.markHeadsetConnected(getContext());
+                    confirmedNoiseState = result.state;
                     TilePreferences.setNoiseControlState(getContext(), result.state);
                     TilePreferences.markNoiseStateRefreshed(getContext());
                     notifyStateChanged();
                 } else if (!result.success) {
-                    TilePreferences.markNoiseStateRefreshed(getContext());
+                    TilePreferences.invalidateNoiseState(getContext());
                     refreshQueued = false;
                 }
 
-                endOperation();
+                endOperation(operation);
                 if (hasPendingWork()) {
                     drainQueue();
                     return;
@@ -625,35 +688,49 @@ public final class NoiseControlDialog extends Dialog {
         });
     }
 
-    private void beginOperation() {
+    private int beginOperation() {
         operationRunning = true;
+        int operation = ++operationGeneration;
         main.removeCallbacks(operationWatchdog);
-        main.postDelayed(operationWatchdog, 9500L);
+        main.postDelayed(operationWatchdog, OPERATION_TIMEOUT_MS);
+        return operation;
     }
 
-    private void endOperation() {
+    private void endOperation(int operation) {
+        if (operation != operationGeneration) return;
         operationRunning = false;
+        activeOperationFuture = null;
         main.removeCallbacks(operationWatchdog);
     }
 
-    private void executeCommand(Runnable work) {
+    private void executeCommand(int operation, Runnable work) {
         try {
-            commands.execute(() -> {
+            Future<?> future = commands.submit(() -> {
                 try {
                     work.run();
                 } catch (Throwable ignored) {
-                    postUi(() -> {
-                        endOperation();
+                    postUi(operation, () -> {
+                        endOperation(operation);
                         clearPendingWork();
+                        restoreConfirmedState();
+                        TilePreferences.invalidateStatus(getContext());
                         TilePreferences.markHeadsetDisconnected(getContext());
+                        notifyStateChanged();
                         updateUi("Not connected");
                     });
                 }
             });
+            if (operation == operationGeneration && operationRunning) {
+                activeOperationFuture = future;
+            } else {
+                future.cancel(true);
+            }
         } catch (RejectedExecutionException ignored) {
             if (!closed) {
-                endOperation();
+                endOperation(operation);
                 clearPendingWork();
+                restoreConfirmedState();
+                notifyStateChanged();
                 updateUi("Not connected");
             }
         }
@@ -668,12 +745,27 @@ public final class NoiseControlDialog extends Dialog {
                 || queuedEqValues != null;
     }
 
-    private void postUi(Runnable runnable) {
+    private void postUi(int operation, Runnable runnable) {
         main.post(() -> {
-            if (!closed) {
+            if (!closed && operation == operationGeneration) {
                 runnable.run();
             }
         });
+    }
+
+    private void handleOperationFailure(String message) {
+        clearPendingWork();
+        restoreConfirmedState();
+        TilePreferences.invalidateStatus(getContext());
+        notifyStateChanged();
+        showFailureToast(message);
+    }
+
+    private void restoreConfirmedState() {
+        TilePreferences.setNoiseControlState(getContext(), confirmedNoiseState);
+        TilePreferences.setSpeakToChatEnabled(getContext(), confirmedSpeakToChat);
+        TilePreferences.setWearPauseEnabled(getContext(), confirmedWearPause);
+        TilePreferences.setEqState(getContext(), confirmedEqPreset, confirmedEqValues);
     }
 
     private void notifyStateChanged() {
@@ -697,9 +789,12 @@ public final class NoiseControlDialog extends Dialog {
                 ? defaultStatus(state)
                 : overrideStatus;
         statusText.setText(status);
-        levelValueText.setText(String.valueOf(state.ambientLevel));
-        if (transparencySlider.getProgress() != state.ambientLevel) {
-            transparencySlider.setProgress(state.ambientLevel);
+        if (!transparencySliderDragging) {
+            setTextIfChanged(levelValueText, String.valueOf(state.ambientLevel));
+        }
+        if (!transparencySliderDragging
+                && !SmoothSlider.isAtValue(transparencySlider, state.ambientLevel)) {
+            SmoothSlider.setValue(transparencySlider, state.ambientLevel);
         }
         setSelected(ancButton, state.mode == NoiseControlState.Mode.ANC);
         setSelected(transparencyButton, state.mode == NoiseControlState.Mode.AMBIENT);
@@ -712,13 +807,15 @@ public final class NoiseControlDialog extends Dialog {
         setSelected(eqUser2Button, preset == TilePreferences.EQ_USER_2);
         int[] eqValues = TilePreferences.eqValues(getContext());
         int clearBass = eqValues[TilePreferences.EQ_CLEAR_BASS_INDEX];
-        clearBassValueText.setText(eqValue(clearBass));
-        if (clearBassSlider.getProgress() != clearBass) {
-            clearBassSlider.setProgress(clearBass);
+        if (!clearBassSliderDragging) {
+            setTextIfChanged(clearBassValueText, eqValue(clearBass));
+        }
+        if (!clearBassSliderDragging && !SmoothSlider.isAtValue(clearBassSlider, clearBass)) {
+            SmoothSlider.setValue(clearBassSlider, clearBass);
         }
         setOnOff(speakOnButton, speakOffButton, TilePreferences.speakToChatEnabled(getContext()));
         setOnOff(wearOnButton, wearOffButton, TilePreferences.wearPauseEnabled(getContext()));
-        setControlsEnabled(canTargetHeadset() && SonyDeviceRepository.hasConnectedAudioProfile(getContext()));
+        setControlsEnabled(canTargetHeadset() && SonyDeviceRepository.isSelectedDeviceConnected(getContext()));
     }
 
     private void scheduleEqualizerSend(long delayMs) {
@@ -772,7 +869,7 @@ public final class NoiseControlDialog extends Dialog {
 
     private SeekBar seekBar(int max) {
         SeekBar seekBar = new SeekBar(getContext());
-        seekBar.setMax(max);
+        SmoothSlider.configure(seekBar, max);
         seekBar.setSplitTrack(false);
         seekBar.setMinimumHeight(dp(40));
         seekBar.setThumb(sliderThumb());
@@ -823,7 +920,7 @@ public final class NoiseControlDialog extends Dialog {
                     : "Bluetooth access required");
             return false;
         }
-        if (!SonyDeviceRepository.hasConnectedAudioProfile(getContext())) {
+        if (!SonyDeviceRepository.isSelectedDeviceConnected(getContext())) {
             TilePreferences.markHeadsetDisconnected(getContext());
             clearPendingWork();
             updateUi("Not connected");
@@ -844,7 +941,7 @@ public final class NoiseControlDialog extends Dialog {
         if (!SonyDeviceRepository.hasConfiguredDevice(getContext())) {
             return "Set up in XM Control";
         }
-        if (!SonyDeviceRepository.hasConnectedAudioProfile(getContext())) {
+        if (!SonyDeviceRepository.isSelectedDeviceConnected(getContext())) {
             return "Not connected";
         }
         return TilePreferences.headsetConnected(getContext())
@@ -889,6 +986,12 @@ public final class NoiseControlDialog extends Dialog {
         if (button == null) return;
         button.setTextColor(selected ? onPrimary : text);
         button.setBackground(buttonBackground(selected ? primary : surfaceVariant));
+    }
+
+    private void setTextIfChanged(TextView view, String value) {
+        if (view != null && !TextUtils.equals(view.getText(), value)) {
+            view.setText(value);
+        }
     }
 
     private void setOnOff(Button onButton, Button offButton, boolean enabled) {
@@ -952,11 +1055,15 @@ public final class NoiseControlDialog extends Dialog {
         setEnabled(wearOnButton, enabled);
         setEnabled(wearOffButton, enabled);
         if (transparencySlider != null) {
-            transparencySlider.setEnabled(enabled);
+            if (!transparencySliderDragging && transparencySlider.isEnabled() != enabled) {
+                transparencySlider.setEnabled(enabled);
+            }
             transparencySlider.setAlpha(1f);
         }
         if (clearBassSlider != null) {
-            clearBassSlider.setEnabled(enabled);
+            if (!clearBassSliderDragging && clearBassSlider.isEnabled() != enabled) {
+                clearBassSlider.setEnabled(enabled);
+            }
             clearBassSlider.setAlpha(1f);
         }
     }

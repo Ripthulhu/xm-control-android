@@ -4,7 +4,6 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
-import android.bluetooth.BluetoothProfile;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Build;
@@ -78,13 +77,13 @@ public final class SonyDeviceRepository {
             }
         }
 
-        if (selected != null && (connected == null || selected.getAddress().equals(connected.getAddress()))) {
+        if (selected != null) {
             return selected;
         }
         if (connected != null) {
             return connected;
         }
-        return selected != null ? selected : fallback;
+        return fallback;
     }
 
     @SuppressLint("MissingPermission")
@@ -109,20 +108,30 @@ public final class SonyDeviceRepository {
     }
 
     @SuppressLint("MissingPermission")
-    public static boolean hasConnectedAudioProfile(Context context) {
+    public static boolean isSelectedDeviceConnected(Context context) {
         if (!hasConnectPermission(context)) return false;
 
         BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
         if (adapter == null || !adapter.isEnabled()) return false;
 
-        if (adapter.getProfileConnectionState(BluetoothProfile.A2DP) == BluetoothAdapter.STATE_CONNECTED) {
-            return true;
+        BluetoothDevice target = null;
+        String selectedAddress = TilePreferences.selectedDeviceAddress(context);
+        Set<BluetoothDevice> bonded = adapter.getBondedDevices();
+        if (bonded != null && selectedAddress != null) {
+            for (BluetoothDevice device : bonded) {
+                if (isSelectedClassicDevice(device, selectedAddress)) {
+                    target = device;
+                    break;
+                }
+            }
         }
-        if (adapter.getProfileConnectionState(BluetoothProfile.HEADSET) == BluetoothAdapter.STATE_CONNECTED) {
-            return true;
+        if (target == null) {
+            target = selectedOrFirstSupportedDevice(context);
         }
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-                && adapter.getProfileConnectionState(BluetoothProfile.LE_AUDIO) == BluetoothAdapter.STATE_CONNECTED;
+        if (target == null) return false;
+
+        Boolean liveState = connectedState(target);
+        return liveState != null ? liveState : TilePreferences.headsetConnected(context);
     }
 
     @SuppressLint("MissingPermission")
@@ -143,13 +152,17 @@ public final class SonyDeviceRepository {
     }
 
     private static boolean isConnectedDevice(BluetoothDevice device) {
+        return Boolean.TRUE.equals(connectedState(device));
+    }
+
+    private static Boolean connectedState(BluetoothDevice device) {
         if (device == null) return false;
         try {
             Method method = BluetoothDevice.class.getMethod("isConnected");
             Object value = method.invoke(device);
-            return value instanceof Boolean && (Boolean) value;
+            return value instanceof Boolean ? (Boolean) value : null;
         } catch (ReflectiveOperationException | RuntimeException ex) {
-            return false;
+            return null;
         }
     }
 

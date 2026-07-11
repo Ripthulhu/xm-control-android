@@ -78,9 +78,6 @@ public final class SonyMdrClient {
         if (!SonyDeviceRepository.hasConnectPermission(context)) {
             return Result.error("Bluetooth permission is not granted.");
         }
-        if (!SonyDeviceRepository.hasConnectedAudioProfile(context)) {
-            return Result.error("Headset is not connected.");
-        }
 
         BluetoothDevice device = SonyDeviceRepository.selectedOrFirstSupportedDevice(context);
         if (device == null) {
@@ -120,6 +117,9 @@ public final class SonyMdrClient {
                             ? "Headset kept the previous setting."
                             : readback.message;
                 }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return Result.error("Operation cancelled.");
             } catch (Exception ex) {
                 Log.w(TAG, "Command failed through " + serviceUuid, ex);
                 lastError = ex;
@@ -136,9 +136,6 @@ public final class SonyMdrClient {
     public static synchronized NoiseControlResult readNoiseControlState(Context context, NoiseControlState fallback) {
         if (!SonyDeviceRepository.hasConnectPermission(context)) {
             return NoiseControlResult.error("Bluetooth permission is not granted.");
-        }
-        if (!SonyDeviceRepository.hasConnectedAudioProfile(context)) {
-            return NoiseControlResult.error("Headset is not connected.");
         }
 
         BluetoothDevice device = SonyDeviceRepository.selectedOrFirstSupportedDevice(context);
@@ -158,6 +155,9 @@ public final class SonyMdrClient {
                         return NoiseControlResult.ok(NoiseControlState.fromPayload(exchange.payload, fallback));
                     }
                     lastExchangeError = exchange.message;
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    return NoiseControlResult.error("Status read cancelled.");
                 } catch (Exception ex) {
                     Log.w(TAG, "Noise control read failed through " + serviceUuid, ex);
                     lastError = ex;
@@ -186,9 +186,6 @@ public final class SonyMdrClient {
         if (!SonyDeviceRepository.hasConnectPermission(context)) {
             return StatusResult.error("Bluetooth permission is not granted.");
         }
-        if (!SonyDeviceRepository.hasConnectedAudioProfile(context)) {
-            return StatusResult.error("Headset is not connected.");
-        }
 
         BluetoothDevice device = SonyDeviceRepository.selectedOrFirstSupportedDevice(context);
         if (device == null) {
@@ -196,14 +193,23 @@ public final class SonyMdrClient {
         }
 
         Exception lastError = null;
+        List<byte[]> collectedPayloads = new ArrayList<>();
         for (UUID serviceUuid : SERVICE_UUIDS) {
             BluetoothSocket socket = null;
             try {
                 socket = connect(context, device, serviceUuid);
-                List<byte[]> payloads = exchangeBatch(socket, FULL_STATUS_COMMANDS, 1300L);
-                if (!payloads.isEmpty()) {
-                    return StatusResult.ok(HeadsetStatus.fromPayloads(payloads, fallback));
+                BatchResult batch = exchangeBatch(socket, FULL_STATUS_COMMANDS, 1300L);
+                if (!batch.payloads.isEmpty()) {
+                    collectedPayloads.addAll(batch.payloads);
+                    if (batch.complete) {
+                        return StatusResult.ok(
+                                HeadsetStatus.fromPayloads(collectedPayloads, fallback),
+                                true);
+                    }
                 }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return StatusResult.error("Status read cancelled.");
             } catch (Exception ex) {
                 Log.w(TAG, "Status read failed through " + serviceUuid, ex);
                 lastError = ex;
@@ -212,15 +218,16 @@ public final class SonyMdrClient {
             }
         }
 
+        if (!collectedPayloads.isEmpty()) {
+            return StatusResult.ok(HeadsetStatus.fromPayloads(collectedPayloads, fallback), false);
+        }
+
         return StatusResult.error(lastError == null ? "Could not read headset status." : lastError.getMessage());
     }
 
     public static synchronized StatusResult sendVoiceGuidance(Context context, SonyCommand command, NoiseControlState fallback) {
         if (!SonyDeviceRepository.hasConnectPermission(context)) {
             return StatusResult.error("Bluetooth permission is not granted.");
-        }
-        if (!SonyDeviceRepository.hasConnectedAudioProfile(context)) {
-            return StatusResult.error("Headset is not connected.");
         }
 
         BluetoothDevice device = SonyDeviceRepository.selectedOrFirstSupportedDevice(context);
@@ -261,9 +268,13 @@ public final class SonyMdrClient {
                         payloads.add(read.payload);
                         return StatusResult.ok(HeadsetStatus.fromPayloads(payloads, fallback));
                     }
-                    return StatusResult.ok(HeadsetStatus.voiceGuidanceSnapshot(enabled, type, language));
+                    lastExchangeError = read.message;
+                    continue;
                 }
                 lastExchangeError = write.message;
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return StatusResult.error("Voice guide update cancelled.");
             } catch (Exception ex) {
                 Log.w(TAG, "Voice guidance command failed through " + serviceUuid, ex);
                 lastError = ex;
@@ -316,9 +327,6 @@ public final class SonyMdrClient {
         if (!SonyDeviceRepository.hasConnectPermission(context)) {
             return StatusResult.error("Bluetooth permission is not granted.");
         }
-        if (!SonyDeviceRepository.hasConnectedAudioProfile(context)) {
-            return StatusResult.error("Headset is not connected.");
-        }
 
         BluetoothDevice device = SonyDeviceRepository.selectedOrFirstSupportedDevice(context);
         if (device == null) {
@@ -340,6 +348,9 @@ public final class SonyMdrClient {
                     return StatusResult.ok(HeadsetStatus.fromPayloads(payloads, NoiseControlState.defaultState()));
                 }
                 lastExchangeError = exchange.message;
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return StatusResult.error("Equalizer read cancelled.");
             } catch (Exception ex) {
                 Log.w(TAG, "Equalizer read failed through " + serviceUuid, ex);
                 lastError = ex;
@@ -373,6 +384,11 @@ public final class SonyMdrClient {
         try {
             future.get(5200, TimeUnit.MILLISECONDS);
             return socket;
+        } catch (InterruptedException ex) {
+            future.cancel(true);
+            closeQuietly(socket);
+            Thread.currentThread().interrupt();
+            throw ex;
         } catch (TimeoutException ex) {
             closeQuietly(socket);
             throw new IOException("Connection timed out.");
@@ -443,6 +459,9 @@ public final class SonyMdrClient {
         int ackRetries = 0;
         boolean acked = !SonyMdrCodec.ackRequired(dataType);
         while (true) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("Bluetooth exchange cancelled.");
+            }
             long now = System.currentTimeMillis();
             if (acked) {
                 if (now >= statusDeadline) {
@@ -518,21 +537,36 @@ public final class SonyMdrClient {
         return command >= 0x40 && command <= 0x49 ? DATA_MDR_NO2 : DATA_MDR;
     }
 
-    private static List<byte[]> exchangeBatch(BluetoothSocket socket, byte[][] commands, long timeoutMs) throws IOException, InterruptedException {
+    private static BatchResult exchangeBatch(BluetoothSocket socket, byte[][] commands, long timeoutMs) throws IOException, InterruptedException {
         List<byte[]> payloads = new ArrayList<>();
         if (commands == null) {
-            return payloads;
+            return new BatchResult(payloads, false);
         }
 
+        boolean complete = true;
         for (int i = 0; i < commands.length; i++) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("Status batch cancelled.");
+            }
             byte[] payload = commands[i];
             ExchangeResult exchange = exchangePayload(socket, payload, expectedForPayload(payload), timeoutMs, i & 1);
             if (exchange.payload != null) {
                 payloads.add(exchange.payload);
             }
+            if (!exchange.success && isRequiredStatusCommand(payload)) {
+                complete = false;
+            }
             Thread.sleep(35L);
         }
-        return payloads;
+        return new BatchResult(payloads, complete);
+    }
+
+    private static boolean isRequiredStatusCommand(byte[] payload) {
+        if (payload == null || payload.length == 0) {
+            return true;
+        }
+        int command = payload[0] & 0xFF;
+        return command != 0x42 && command != 0x46 && command != 0x52 && command != 0x5A;
     }
 
     private static ExchangeResult readBackAfterWrite(BluetoothSocket socket, SonyCommand command) throws IOException, InterruptedException {
@@ -764,6 +798,16 @@ public final class SonyMdrClient {
         }
     }
 
+    private static final class BatchResult {
+        final List<byte[]> payloads;
+        final boolean complete;
+
+        BatchResult(List<byte[]> payloads, boolean complete) {
+            this.payloads = payloads;
+            this.complete = complete;
+        }
+    }
+
     public static final class NoiseControlResult {
         public final boolean success;
         public final String message;
@@ -788,19 +832,25 @@ public final class SonyMdrClient {
         public final boolean success;
         public final String message;
         public final HeadsetStatus status;
+        public final boolean complete;
 
-        private StatusResult(boolean success, String message, HeadsetStatus status) {
+        private StatusResult(boolean success, String message, HeadsetStatus status, boolean complete) {
             this.success = success;
             this.message = message;
             this.status = status;
+            this.complete = complete;
         }
 
         public static StatusResult ok(HeadsetStatus status) {
-            return new StatusResult(true, "", status);
+            return ok(status, true);
+        }
+
+        public static StatusResult ok(HeadsetStatus status, boolean complete) {
+            return new StatusResult(true, "", status, complete);
         }
 
         public static StatusResult error(String message) {
-            return new StatusResult(false, message == null ? "Status read failed." : message, null);
+            return new StatusResult(false, message == null ? "Status read failed." : message, null, false);
         }
     }
 }

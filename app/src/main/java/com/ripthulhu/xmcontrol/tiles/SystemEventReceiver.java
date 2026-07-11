@@ -43,6 +43,10 @@ public final class SystemEventReceiver extends BroadcastReceiver {
         if (device != null && !SonyDeviceRepository.isSelectedOrSupportedDevice(context, device)) {
             return;
         }
+        String selectedAddress = TilePreferences.selectedDeviceAddress(context);
+        if (device != null && selectedAddress != null && !selectedAddress.equals(device.getAddress())) {
+            return;
+        }
 
         int state = connectionState(intent, action);
         if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action) || state == BluetoothProfile.STATE_CONNECTED) {
@@ -52,11 +56,12 @@ public final class SystemEventReceiver extends BroadcastReceiver {
         }
 
         if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action) || state == BluetoothProfile.STATE_DISCONNECTED) {
+            TilePreferences.markHeadsetDisconnected(context);
             BroadcastReceiver.PendingResult pendingResult = goAsync();
             Thread verifier = new Thread(() -> {
                 try {
                     Thread.sleep(1200L);
-                    if (!SonyDeviceRepository.hasConnectedAudioProfile(context)) {
+                    if (!SonyDeviceRepository.isSelectedDeviceConnected(context)) {
                         TilePreferences.markHeadsetDisconnected(context);
                     }
                     requestTileRefresh(context);

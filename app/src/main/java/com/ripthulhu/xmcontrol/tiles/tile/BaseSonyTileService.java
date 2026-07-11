@@ -50,7 +50,7 @@ abstract class BaseSonyTileService extends TileService {
         tile.setLabel(tileLabel());
         boolean permitted = isReady();
         boolean configured = SonyDeviceRepository.hasConfiguredDevice(this);
-        boolean connected = configured && SonyDeviceRepository.hasConnectedAudioProfile(this);
+        boolean connected = configured && SonyDeviceRepository.isSelectedDeviceConnected(this);
         if (connected && !TilePreferences.headsetConnected(this)) {
             TilePreferences.markHeadsetConnected(this);
         } else if (!connected && TilePreferences.headsetConnected(this)) {
