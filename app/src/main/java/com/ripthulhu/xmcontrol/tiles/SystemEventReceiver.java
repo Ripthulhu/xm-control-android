@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothA2dp;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothHeadset;
+import android.bluetooth.BluetoothLeAudio;
 import android.bluetooth.BluetoothProfile;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -25,6 +26,7 @@ public final class SystemEventReceiver extends BroadcastReceiver {
 
         String action = intent.getAction();
         if (Intent.ACTION_BOOT_COMPLETED.equals(action)) {
+            TilePreferences.setActiveDeviceName(context, null);
             TilePreferences.markHeadsetDisconnected(context);
             requestTileRefresh(context);
             return;
@@ -43,25 +45,26 @@ public final class SystemEventReceiver extends BroadcastReceiver {
         if (device != null && !SonyDeviceRepository.isSelectedOrSupportedDevice(context, device)) {
             return;
         }
-        String selectedAddress = TilePreferences.selectedDeviceAddress(context);
-        if (device != null && selectedAddress != null && !selectedAddress.equals(device.getAddress())) {
-            return;
-        }
-
         int state = connectionState(intent, action);
         if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action) || state == BluetoothProfile.STATE_CONNECTED) {
-            TilePreferences.markHeadsetConnected(context);
+            if (device != null) {
+                SonyDeviceRepository.noteConnectedIdentity(context, device);
+            } else {
+                TilePreferences.markHeadsetConnected(context);
+            }
             requestTileRefresh(context);
             return;
         }
 
         if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action) || state == BluetoothProfile.STATE_DISCONNECTED) {
-            TilePreferences.markHeadsetDisconnected(context);
             BroadcastReceiver.PendingResult pendingResult = goAsync();
             Thread verifier = new Thread(() -> {
                 try {
                     Thread.sleep(1200L);
-                    if (!SonyDeviceRepository.isSelectedDeviceConnected(context)) {
+                    if (SonyDeviceRepository.isSelectedDeviceConnected(context)) {
+                        TilePreferences.markHeadsetConnected(context);
+                    } else {
+                        SonyDeviceRepository.clearActiveDeviceIfDisconnected(context);
                         TilePreferences.markHeadsetDisconnected(context);
                     }
                     requestTileRefresh(context);
@@ -77,7 +80,9 @@ public final class SystemEventReceiver extends BroadcastReceiver {
 
     private int connectionState(Intent intent, String action) {
         if (BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED.equals(action)
-                || BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED.equals(action)) {
+                || BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED.equals(action)
+                || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && BluetoothLeAudio.ACTION_LE_AUDIO_CONNECTION_STATE_CHANGED.equals(action))) {
             return intent.getIntExtra(BluetoothProfile.EXTRA_STATE, BluetoothProfile.STATE_DISCONNECTED);
         }
         return -1;
