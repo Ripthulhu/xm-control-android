@@ -91,7 +91,7 @@ public final class SonyDeviceRepository {
 
         try {
             return adapter.getProfileConnectionState(BluetoothProfile.LE_AUDIO)
-                    == BluetoothProfile.STATE_CONNECTED;
+                    == BluetoothAdapter.STATE_CONNECTED;
         } catch (RuntimeException ex) {
             return false;
         }
