@@ -16,6 +16,7 @@ public final class TilePreferences {
 
     private static final String NAME = "xm_control_tiles";
     private static final String KEY_DEVICE_ADDRESS = "device_address";
+    private static final String KEY_ACTIVE_DEVICE_NAME = "active_device_name";
     private static final String KEY_NOISE_MODE = "noise_mode";
     private static final String KEY_AMBIENT_LEVEL = "ambient_level";
     private static final String KEY_AMBIENT_VOICE = "ambient_voice";
@@ -57,6 +58,20 @@ public final class TilePreferences {
                     .remove(KEY_BATTERY_TEXT)
                     .putLong(KEY_STATUS_LAST_REFRESH, 0L)
                     .putLong(KEY_NOISE_LAST_REFRESH, 0L);
+        }
+        editor.apply();
+    }
+
+    public static String activeDeviceName(Context context) {
+        return prefs(context).getString(KEY_ACTIVE_DEVICE_NAME, null);
+    }
+
+    public static void setActiveDeviceName(Context context, String name) {
+        SharedPreferences.Editor editor = prefs(context).edit();
+        if (name == null) {
+            editor.remove(KEY_ACTIVE_DEVICE_NAME);
+        } else {
+            editor.putString(KEY_ACTIVE_DEVICE_NAME, name);
         }
         editor.apply();
     }

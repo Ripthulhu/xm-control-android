@@ -8,6 +8,7 @@ import android.app.StatusBarManager;
 import android.bluetooth.BluetoothA2dp;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothHeadset;
+import android.bluetooth.BluetoothLeAudio;
 import android.bluetooth.BluetoothProfile;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -708,7 +709,7 @@ public final class MainActivity extends Activity {
     @SuppressLint("MissingPermission")
     private RadioButton deviceRow(BluetoothDevice device, String selected) {
         RadioButton row = new RadioButton(this);
-        row.setText(device.getName() + "\n" + device.getAddress());
+        row.setText(device.getName());
         row.setTextColor(text);
         row.setTextSize(15);
         row.setIncludeFontPadding(false);
@@ -740,6 +741,9 @@ public final class MainActivity extends Activity {
         filter.addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED);
         filter.addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            filter.addAction(BluetoothLeAudio.ACTION_LE_AUDIO_CONNECTION_STATE_CHANGED);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(bluetoothReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         } else {
             registerReceiver(bluetoothReceiver, filter);
@@ -768,7 +772,7 @@ public final class MainActivity extends Activity {
         if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action) || state == BluetoothProfile.STATE_CONNECTED) {
             main.removeCallbacks(delayedConnectionCheck);
             if (device != null) {
-                TilePreferences.setSelectedDeviceAddress(this, device.getAddress());
+                SonyDeviceRepository.noteConnectedIdentity(this, device);
             }
             statusFailureCount = 0;
             localChangeVersion++;
@@ -776,8 +780,7 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        if ((BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action) || state == BluetoothProfile.STATE_DISCONNECTED)
-                && (device == null || device.getAddress().equals(TilePreferences.selectedDeviceAddress(this)))) {
+        if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action) || state == BluetoothProfile.STATE_DISCONNECTED) {
             statusFailureCount = Math.max(statusFailureCount, 1);
             renderState("Checking connection...");
             main.removeCallbacks(delayedConnectionCheck);
@@ -788,7 +791,9 @@ public final class MainActivity extends Activity {
 
     private int connectionState(Intent intent, String action) {
         if (BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED.equals(action)
-                || BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED.equals(action)) {
+                || BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED.equals(action)
+                || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && BluetoothLeAudio.ACTION_LE_AUDIO_CONNECTION_STATE_CHANGED.equals(action))) {
             return intent.getIntExtra(BluetoothProfile.EXTRA_STATE, BluetoothProfile.STATE_DISCONNECTED);
         }
         return -1;
